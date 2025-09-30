@@ -1,0 +1,1502 @@
+--// ============================================================
+--//  Auto Fishing • Full Version (Quest Focus + Event Lock)
+--//  Tanpa invis karakter & tanpa sembunyi nama/level
+--// ============================================================
+
+-- ====== Services & Locals ======
+local Players            = game:GetService("Players")
+local ReplicatedStorage  = game:GetService("ReplicatedStorage")
+local TweenService       = game:GetService("TweenService")
+local HttpService        = game:GetService("HttpService")
+local LocalPlayer        = Players.LocalPlayer
+
+-- Quests & Replion
+local QuestUtility = require(ReplicatedStorage.Shared.Quests.QuestUtility)
+local QuestList    = require(ReplicatedStorage.Shared.Quests.QuestList)
+local DeepSea      = QuestList.DeepSea
+
+-- IkanTongkol GUI
+local IKUI = loadstring(game:HttpGet("https://raw.githubusercontent.com/IkantTongkol/Gui/refs/heads/main/Test5"))()
+
+-- ===== Network references (sleitnick/net) =====
+local netRoot = ReplicatedStorage:WaitForChild("Packages"):WaitForChild("_Index")
+    :WaitForChild("sleitnick_net@0.2.0"):WaitForChild("net")
+
+local RF_Charge       = netRoot:WaitForChild("RF/ChargeFishingRod")
+local RF_Start        = netRoot:WaitForChild("RF/RequestFishingMinigameStarted")
+local RE_Complete     = netRoot:WaitForChild("RE/FishingCompleted")
+local RE_FavoriteItem = netRoot:FindFirstChild("RE/FavoriteItem") or netRoot:FindFirstChild("RE_FavoriteItem")
+
+-- ===== Animations (opsional) =====
+local Animations, AnimationController
+pcall(function()
+    Animations = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("Animations"))
+    AnimationController = require(ReplicatedStorage:WaitForChild("Controllers"):WaitForChild("AnimationController"))
+end)
+
+-- ===== Optional utilities =====
+local TierUtility; pcall(function() TierUtility = require(ReplicatedStorage.Shared.TierUtility) end)
+local ItemUtility; pcall(function() ItemUtility = require(ReplicatedStorage.Shared.ItemUtility) end)
+
+-- ===== Utils =====
+local function getRoot()
+    local char = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+    return char:WaitForChild("HumanoidRootPart")
+end
+
+-- ===== Notify (toast + SetCore) =====
+local __uiWindow -- di-set setelah CreateWindow
+local function notify(msg, title)
+    title = title or "Fishing"
+    pcall(function()
+        if __uiWindow and __uiWindow.Notify then
+            __uiWindow:Notify(title, tostring(msg), 2.2)
+        end
+        game:GetService("StarterGui"):SetCore("SendNotification", {
+            Title = title, Text = tostring(msg), Duration = 2
+        })
+    end)
+    print("[Fishing] " .. tostring(msg))
+end
+
+-- ===== State utama =====
+local running, animEnabled = false, false
+local useServerTime = true         -- untuk No-Anim (toggle)
+local currentStage  = "Idle"
+local animThread
+local autoSellEnabled, autoSellThread = false, nil
+local sellInterval = 60
+
+-- ===== Presets =====
+local function _coercePreset(opt)
+    if type(opt) == "table" then opt = opt[1] end
+    if type(opt) ~= "string" then return nil end
+    local s = opt:lower()
+    if s:find("fast") then return "Fast" end
+    if s:find("balanced") then return "Balanced" end
+    if s:find("safe") then return "Safe" end
+    return nil
+end
+
+local cfgNoAnim = { firstCatchDelay=0.50, catchCount=2, catchDelay=0.70, loopDelay=1.00 }
+local cfgAnim   = { afterCastReady=0.35, catchTimes=2, betweenCatchDelay=0.65, loopDelay=0.80, throwLineRatio=0.45 }
+
+local PRESETS = {
+    Safe = {
+        noanim={firstCatchDelay=1.20, catchCount=3, catchDelay=0.80, loopDelay=1.10},
+        anim  ={afterCastReady=0.45, catchTimes=3, betweenCatchDelay=0.80, loopDelay=1.10, throwLineRatio=0.45}
+    },
+    Balanced = {
+        noanim={firstCatchDelay=0.50, catchCount=2, catchDelay=0.70, loopDelay=1.00},
+        anim  ={afterCastReady=0.35, catchTimes=2, betweenCatchDelay=0.65, loopDelay=0.80, throwLineRatio=0.45}
+    },
+    Fast = {
+        noanim={firstCatchDelay=0.28, catchCount=2, catchDelay=0.40, loopDelay=0.65},
+        anim  ={afterCastReady=0.25, catchTimes=2, betweenCatchDelay=0.30, loopDelay=0.20, throwLineRatio=0.25}
+    }
+}
+local __currentPreset = "Balanced"
+
+local function applyPreset(name)
+    local p = PRESETS[name] or PRESETS.Balanced
+    for k,v in pairs(p.noanim) do cfgNoAnim[k] = v end
+    for k,v in pairs(p.anim)   do cfgAnim[k]   = v end
+    __currentPreset = name
+end
+applyPreset("Balanced")
+
+-- ===== Preset khusus Quest (Fast aman + fallback) =====
+local function _cloneTable(t)
+    local r = {}
+    for k,v in pairs(t or {}) do
+        r[k] = (type(v)=="table") and _cloneTable(v) or v
+    end
+    return r
+end
+local __questPresetStack = nil
+local function _clampServerSafe()
+    cfgNoAnim.firstCatchDelay = math.max(cfgNoAnim.firstCatchDelay or 0, 0.40)
+    cfgNoAnim.catchDelay      = math.max(cfgNoAnim.catchDelay or 0,      0.45)
+    cfgNoAnim.loopDelay       = math.max(cfgNoAnim.loopDelay or 0,       0.65)
+    cfgAnim.afterCastReady    = math.max(cfgAnim.afterCastReady or 0,    0.28)
+    cfgAnim.betweenCatchDelay = math.max(cfgAnim.betweenCatchDelay or 0, 0.30)
+    cfgAnim.loopDelay         = math.max(cfgAnim.loopDelay or 0,         0.45)
+end
+
+local function questPreset_onStart()
+    if __questPresetStack then return end
+    __questPresetStack = { noanim=_cloneTable(cfgNoAnim), anim=_cloneTable(cfgAnim), preset=__currentPreset }
+    local QFAST = {
+        noanim = { firstCatchDelay=0.42, catchCount=2, catchDelay=0.50, loopDelay=0.75 },
+        anim   = { afterCastReady=0.30, catchTimes=2, betweenCatchDelay=0.34, loopDelay=0.50, throwLineRatio=0.47 }
+    }
+    for k,v in pairs(QFAST.noanim) do cfgNoAnim[k]=v end
+    for k,v in pairs(QFAST.anim)   do cfgAnim[k]=v   end
+    _clampServerSafe()
+    __currentPreset = "Fast(Quest)"
+end
+local function questPreset_fallbackBalanced()
+    applyPreset("Balanced"); _clampServerSafe()
+    __currentPreset = "Balanced(Quest)"
+end
+local function questPreset_onStop()
+    if not __questPresetStack then return end
+    for k in pairs(cfgNoAnim) do cfgNoAnim[k]=nil end
+    for k in pairs(cfgAnim)   do cfgAnim[k]=nil   end
+    for k,v in pairs(__questPresetStack.noanim) do cfgNoAnim[k]=v end
+    for k,v in pairs(__questPresetStack.anim)   do cfgAnim[k]=v   end
+    __currentPreset = __questPresetStack.preset or __currentPreset
+    __questPresetStack = nil
+end
+
+-- ===== Minigame & Anim helpers =====
+local function animDur(name, fallback)
+    if not Animations then return fallback end
+    local def = Animations[name]; if not def then return fallback end
+    local L = tonumber(def.Length) or fallback
+    local S = tonumber(def.PlaybackSpeed) or 1; if S<=0 then S=1 end
+    return L / S
+end
+
+local function getFishingGuiRefs()
+    local pg = Players.LocalPlayer:FindFirstChild("PlayerGui"); if not pg then return nil end
+    local fishingGui = pg:FindFirstChild("Fishing"); if not fishingGui then return nil end
+    local main     = fishingGui:FindFirstChild("Main")
+    local display  = main and main:FindFirstChild("Display")
+    local cg       = display and display:FindFirstChild("CanvasGroup")
+    local leftBar  = cg and cg:FindFirstChild("Left")  and cg.Left:FindFirstChild("Bar")
+    local rightBar = cg and cg:FindFirstChild("Right") and cg.Right:FindFirstChild("Bar")
+    local minigame = display and display:FindFirstChild("Minigame")
+    local mover    = minigame and minigame:FindFirstChild("Mover")
+    local animBG   = display and display:FindFirstChild("AnimationBG")
+    local gradient = animBG and animBG:FindFirstChild("UIGradient")
+    local topTop   = main and main:FindFirstChild("TopTop")
+    local top      = topTop and topTop:FindFirstChild("Top")
+    local counter  = top and top:FindFirstChild("Counter")
+    local clickLbl = counter and counter:FindFirstChild("ClickCount")
+    return { fishingGui=fishingGui, main=main, leftBar=leftBar, rightBar=rightBar, mover=mover, gradient=gradient, clickLbl=clickLbl }
+end
+
+local function showMinigameGUI(DUR)
+    local r = getFishingGuiRefs()
+    if not r then return function()end,function()end,function()end,function()end end
+    local fishingGui, main, leftBar, rightBar, mover, gradient, clickLbl =
+        r.fishingGui, r.main, r.leftBar, r.rightBar, r.mover, r.gradient, r.clickLbl
+
+    fishingGui.Enabled = true
+    if main then
+        main.Position = UDim2.fromScale(0.5, 1.5)
+        TweenService:Create(main, TweenInfo.new(math.max(0.12, (DUR.ReelStart or 0.6)*0.32), Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+            { Position = UDim2.fromScale(0.5, 0.95) }):Play()
+    end
+    if leftBar  then leftBar.Size  = UDim2.fromScale(0,1) end
+    if rightBar then rightBar.Size = UDim2.fromScale(0,1) end
+    if mover then
+        mover.Size = UDim2.fromScale(1.2, 1.2); mover.Rotation = 0
+        TweenService:Create(mover, TweenInfo.new(math.max(0.30, (DUR.ReelStart or 0.6)*0.45), Enum.EasingStyle.Back, Enum.EasingDirection.Out),
+            { Size = UDim2.fromScale(1,1), Rotation = math.random(-8,8) }):Play()
+    end
+    if gradient then
+        gradient.Offset = Vector2.new(-1.5, 0)
+        TweenService:Create(gradient, TweenInfo.new(math.max(0.9, (DUR.ReelLoop or 1.1)*0.7), Enum.EasingStyle.Linear, Enum.EasingDirection.Out),
+            { Offset = Vector2.new(1.5, 0) }):Play()
+    end
+
+    local clicks=0
+    local function renderClicks() if clickLbl and clickLbl:IsA("TextLabel") then clickLbl.Text = string.format("(%03d)", clicks % 1000) end end
+    local function setClicks(n) clicks = math.max(0, math.floor(n or 0)); renderClicks() end
+    local function bumpClick(k) clicks = clicks + (k or 1); renderClicks() end
+    renderClicks()
+
+    local function setProgress(p, dur)
+        p = math.clamp(p, 0, 1)
+        local goal = (p >= 1) and 1 or math.min(p, 0.985)
+        local tDur = dur or math.max(0.18, (DUR.ReelLoop or 1.1)*0.2)
+        if leftBar then TweenService:Create(leftBar, TweenInfo.new(tDur, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), { Size = UDim2.fromScale(goal, 1) }):Play() end
+        if rightBar then TweenService:Create(rightBar, TweenInfo.new(tDur, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), { Size = UDim2.fromScale(goal, 1) }):Play() end
+    end
+    local function close()
+        if main then
+            TweenService:Create(main, TweenInfo.new(math.max(0.12, (DUR.ReelStart or 0.6)*0.3), Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+                { Position = UDim2.fromScale(0.5, 1.5) }):Play()
+            task.wait(math.max(0.16, (DUR.ReelStart or 0.6)*0.32))
+        end
+        pcall(function() fishingGui.Enabled = false end)
+    end
+    return close, setProgress, setClicks, bumpClick
+end
+
+-- ===== Casting helper =====
+local function getCastWaterY()
+    local hrp = getRoot()
+    local origin = (hrp.CFrame + hrp.CFrame.LookVector * 12).Position
+    local dir = Vector3.new(0, -1, 0) * 200
+    local rp = RaycastParams.new()
+    rp.IgnoreWater = false; rp.RespectCanCollide = false
+    rp.FilterType = Enum.RaycastFilterType.Exclude
+    rp.FilterDescendantsInstances = {hrp.Parent}
+    local hit = workspace:Raycast(origin, dir, rp)
+    return (hit and hit.Position.Y) or (hrp.Position.Y - 6)
+end
+
+-- ===== Core Fishing (No Anim, param: useServerTimeNow) =====
+local inNoAnimLoop = false
+local function loop_NoAnim()
+    getRoot()
+    while running do
+        currentStage = "Charge"
+        pcall(function()
+            if useServerTime then
+                RF_Charge:InvokeServer(workspace:GetServerTimeNow())
+            else
+                RF_Charge:InvokeServer(0) -- fallback tanpa server time
+            end
+        end)
+
+        currentStage = "Release"
+        local waterY = getCastWaterY()
+        pcall(function() RF_Start:InvokeServer(waterY, 1.0) end)
+
+        if (cfgNoAnim.firstCatchDelay or 0) > 0 then task.wait(cfgNoAnim.firstCatchDelay) end
+        currentStage = "Catch"
+        local times = math.max(1, math.floor(cfgNoAnim.catchCount or 1))
+        for i=1, times do
+            if not running then break end
+            pcall(function() RE_Complete:FireServer() end)
+            if i<times then task.wait(cfgNoAnim.catchDelay or 0.6) end
+        end
+        if (cfgNoAnim.loopDelay or 0) > 0 then task.wait(cfgNoAnim.loopDelay) end
+    end
+    currentStage = "Idle"
+end
+
+-- ===== Core Fishing (Animated) =====
+local inAnimCycle = false
+local function anim_oneCycle()
+    if inAnimCycle then return end
+    inAnimCycle = true
+    getRoot()
+
+    currentStage = "Charge"
+    pcall(function()
+        if AnimationController then
+            AnimationController:StopAnimation("FishingRodReelIdle")
+            AnimationController:StopAnimation("EasyFishReelStart")
+            AnimationController:PlayAnimation("StartChargingRod1Hand")
+        end
+    end)
+    local durCharge = animDur("StartChargingRod1Hand", 0.7)
+    pcall(function()
+        if useServerTime then
+            RF_Charge:InvokeServer(workspace:GetServerTimeNow())
+        else
+            RF_Charge:InvokeServer(0)
+        end
+    end)
+    task.wait(math.min(0.20, durCharge * 0.25))
+
+    currentStage = "Cast"
+    local durCast = animDur("CastFromFullChargePosition1Hand", 0.9)
+    pcall(function()
+        if AnimationController then
+            AnimationController:DestroyActiveAnimationTracks({"FishingRodCharacterIdle2"})
+            AnimationController:PlayAnimation("CastFromFullChargePosition1Hand")
+        end
+    end)
+    task.wait(durCast * (cfgAnim.throwLineRatio or 0.45))
+    local waterY = getCastWaterY()
+    pcall(function() RF_Start:InvokeServer(waterY, 1.0) end)
+
+    local reelStartDur = animDur("EasyFishReelStart", 0.6)
+    local reelLoopDur  = animDur("EasyFishReel", 1.1)
+
+    currentStage = "ReelStart"
+    pcall(function()
+        if AnimationController then
+            AnimationController:StopAnimation("FishingRodReelIdle")
+            AnimationController:PlayAnimation("EasyFishReelStart")
+        end
+    end)
+    local closeMini, setProgress, setClicks, bumpClick = showMinigameGUI({ReelStart=reelStartDur, ReelLoop=reelLoopDur})
+    task.wait(reelStartDur + 0.10)
+
+    currentStage = "Reel"
+    pcall(function() if AnimationController then AnimationController:PlayAnimation("EasyFishReel") end end)
+    setProgress(0.12, 0.25); setClicks(0)
+    task.wait(cfgAnim.afterCastReady or 0.35)
+
+    currentStage = "Catch"
+    local times = math.max(1, math.floor(cfgAnim.catchTimes or 1))
+    for i=1, times do
+        if not animEnabled then break end
+        local target = math.min(0.92, i / (times + 0.25))
+        setProgress(target, (cfgAnim.betweenCatchDelay or 0.6) * 0.6)
+        pcall(function() RE_Complete:FireServer() end)
+        bumpClick(1)
+        if i<times then task.wait(cfgAnim.betweenCatchDelay or 0.6) end
+    end
+    setProgress(1.0, math.max(0.25, reelLoopDur * 0.25))
+    task.wait(0.15); closeMini()
+
+    currentStage = "Delay"
+    task.wait(cfgAnim.loopDelay or 0.8)
+
+    currentStage = "Idle"
+    inAnimCycle = false
+end
+
+-- ===== Start/Stop =====
+local function start_NoAnim()
+    if running then return end
+    running = true
+    currentStage = "Starting"
+    task.spawn(loop_NoAnim)
+    notify("Auto Fishing: ON (No-Anim)")
+end
+local function stop_NoAnim()
+    if not running then return end
+    running = false
+    currentStage = "Idle"
+    notify("Auto Fishing: OFF (No-Anim)")
+end
+local function start_Anim()
+    if animEnabled then return end
+    inAnimCycle = false
+    animEnabled = true
+    animThread = task.spawn(function()
+        while animEnabled do
+            anim_oneCycle()
+            task.wait(0.03)
+        end
+    end)
+    notify("Auto Fishing: ON (Animated)")
+end
+local function stop_Anim()
+    if (not animEnabled) and (not animThread) then return end
+    animEnabled = false
+    if animThread then task.cancel(animThread); animThread = nil end
+    inAnimCycle = false
+    pcall(function()
+        if AnimationController then
+            AnimationController:DestroyActiveAnimationTracks()
+            AnimationController:PlayAnimation("FishingRodCharacterIdle2")
+        end
+    end)
+    currentStage = "Idle"
+    notify("Auto Fishing (Animated): OFF")
+end
+local function stopAllFishingLoops()
+    if animEnabled or animThread then stop_Anim() end
+    if running then stop_NoAnim() end
+end
+
+--========================================================
+--= Event Lock (scan Props + auto-TP last spot)
+--========================================================
+local replionOk, ReplionClient = pcall(function()
+    return require(ReplicatedStorage:WaitForChild("Packages"):WaitForChild("Replion")).Client
+end)
+local dataReplion = nil
+if replionOk then pcall(function() dataReplion = ReplionClient:WaitReplion("Data") end) end
+
+local EVENT_LIST = {
+    "Black Hole","Ghost Worm","Meteor Rain","Shocked",
+    "Ghost Shark Hunt","Shark Hunt","Worm Hunt","Sparkling Cove","Megalodon",
+}
+local EVENT_NAME = EVENT_LIST[1]
+
+local UP_OFFSET=3.5; local PAD_SIZE_Y=0.4; local SCAN_INTERVAL=2.5
+local RELOCK_THRESHOLD_H=40; local DRIFT_THRESHOLD=2.0
+local RELOCK_MIN_GAP=5.0; local RECENTER_MIN_GAP=2.0
+
+local __waterPartsCache
+local function getWaterParts()
+    if __waterPartsCache then return __waterPartsCache end
+    local list = {}
+    for _,inst in ipairs(workspace:GetDescendants()) do
+        if inst:IsA("BasePart") then
+            local n = (inst.Name or ""):lower()
+            if inst.Material == Enum.Material.Water or n:find("water") or n:find("ocean") or n:find("sea") then
+                table.insert(list, inst)
+            end
+        end
+    end
+    __waterPartsCache = list
+    return list
+end
+
+local function rayToWater(pos, height, depth)
+    height = height or 400; depth = depth or 2000
+    local origin = pos + Vector3.new(0, height, 0)
+    local dir    = Vector3.new(0, -(height + depth), 0)
+
+    local rp1 = RaycastParams.new()
+    rp1.FilterType = Enum.RaycastFilterType.Exclude
+    rp1.FilterDescendantsInstances = { Players.LocalPlayer.Character }
+    rp1.IgnoreWater = false
+    local hit1 = workspace:Raycast(origin, dir, rp1)
+    if hit1 and hit1.Material == Enum.Material.Water then
+        return hit1.Position, "TERRAIN"
+    end
+
+    local parts = getWaterParts()
+    if #parts > 0 then
+        local rp2 = RaycastParams.new()
+        rp2.FilterType = Enum.RaycastFilterType.Include
+        rp2.FilterDescendantsInstances = parts
+        rp2.IgnoreWater = true
+        local hit2 = workspace:Raycast(origin, dir, rp2)
+        if hit2 then return hit2.Position, "PART" end
+    end
+    return nil
+end
+
+local function findWaterRobust(cf)
+    local p, tag = rayToWater(cf.Position); if p then return true, p, tag end
+    local base = cf.Position
+    local rings = {6,12,18,24,32,40,56,72,96,128,160,192,224,256,320,384}
+    for _,r in ipairs(rings) do
+        local step = (r <= 96) and 15 or 12
+        for a = 0, 360 - step, step do
+            local rad = math.rad(a)
+            local pos = base + Vector3.new(math.cos(rad)*r, 0, math.sin(rad)*r)
+            local pp, t2 = rayToWater(pos)
+            if pp then return true, pp, t2 end
+        end
+    end
+    return false
+end
+
+local function getEventPivotCF(targetName)
+    local props = workspace:FindFirstChild("Props"); if not props then return nil end
+    local hrp = getRoot()
+    local function cfOf(inst)
+        if inst:IsA("Model") then
+            local ok, cf = pcall(inst.GetPivot, inst); if ok and typeof(cf)=="CFrame" then return cf end
+            local pp = inst.PrimaryPart or inst:FindFirstChildWhichIsA("BasePart")
+            if pp then return pp.CFrame end
+            local ok2, cf2 = pcall(inst.GetBoundingBox, inst)
+            if ok2 and typeof(cf2)=="CFrame" then return cf2 end
+        elseif inst:IsA("BasePart") then
+            return inst.CFrame
+        end
+    end
+    local function hasWater(cf) local ok,a=pcall(function() return select(1, findWaterRobust(cf)) end); return ok and a==true end
+    local direct = props:FindFirstChild(targetName)
+    if direct then local cf = cfOf(direct); if cf then return cf end end
+
+    local candidates={}
+    for _,inst in ipairs(props:GetDescendants()) do
+        if inst:IsA("Model") or inst:IsA("BasePart") then
+            local score=0
+            if inst.Name==targetName then score=100
+            elseif inst.Parent and inst.Parent.Name==targetName then score=90
+            elseif inst.Parent and inst.Parent.Parent and inst.Parent.Parent.Name==targetName then score=80
+            elseif inst.Name=="Model" then score=50 else score=10 end
+            local cf=cfOf(inst)
+            if cf then
+                local dist = (cf.Position - hrp.Position).Magnitude
+                table.insert(candidates, {cf=cf, score=score, dist=dist})
+            end
+        end
+    end
+    table.sort(candidates, function(a,b) if a.score==b.score then return a.dist<b.dist else return a.score>b.score end end)
+    for _,c in ipairs(candidates) do if hasWater(c.cf) then return c.cf end end
+    if candidates[1] then return candidates[1].cf end
+    return nil
+end
+
+-- Freeze (Align + pad) untuk lock di permukaan air
+local FR = { enabled=false }
+local function computePadCF(standPos, hipHeight, padHeight)
+    local topY = standPos.Y - hipHeight
+    local padY = topY - padHeight*0.5
+    return CFrame.new(standPos.X, padY, standPos.Z)
+end
+local function enableFreezeAt(posCF)
+    local hrp = getRoot()
+    local hum = hrp.Parent:FindFirstChildOfClass("Humanoid")
+    local hip = (hum and hum.HipHeight) or 2
+
+    if not FR.enabled then
+        FR.saved = {
+            anchored   = hrp.Anchored,
+            platform   = hum and hum.PlatformStand or nil,
+            autoRotate = hum and hum.AutoRotate or nil,
+            walk       = hum and hum.WalkSpeed or nil,
+            useJP      = hum and hum.UseJumpPower or nil,
+            jump       = hum and (hum.UseJumpPower and hum.JumpPower or hum.JumpHeight) or nil,
+            hip        = hip
+        }
+        hrp.Anchored = false
+        if hum then
+            hum.PlatformStand = false
+            hum.AutoRotate    = false
+            hum.WalkSpeed     = 0
+            if hum.UseJumpPower then hum.JumpPower = 0 else hum.JumpHeight = 0 end
+        end
+
+        local anchor = Instance.new("Part")
+        anchor.Name = "FishingFreezeAnchor"
+        anchor.Size = Vector3.new(2,1,2)
+        anchor.Transparency = 1
+        anchor.CanCollide = false
+        anchor.Anchored = true
+        anchor.CFrame = CFrame.new(posCF.Position)
+        anchor.Parent = workspace
+
+        local pad = Instance.new("Part")
+        pad.Name = "FishingFreezePad"
+        pad.Size = Vector3.new(6,  PAD_SIZE_Y, 6)
+        pad.Transparency = 1
+        pad.CanCollide = true
+        pad.Anchored = true
+        pad.CFrame = computePadCF(posCF.Position, hip, pad.Size.Y)
+        pad.Parent = workspace
+
+        local a0 = Instance.new("Attachment", hrp);     a0.Name="FF_Att0"
+        local a1 = Instance.new("Attachment", anchor);  a1.Name="FF_Att1"
+
+        local ap = Instance.new("AlignPosition", hrp)
+        ap.Name="FF_AlignPos"; ap.Attachment0=a0; ap.Attachment1=a1
+        ap.RigidityEnabled=true; ap.MaxForce=1e9; ap.Responsiveness=200
+
+        local ao = Instance.new("AlignOrientation", hrp)
+        ao.Name="FF_AlignOri"; ao.Attachment0=a0; ao.Attachment1=a1
+        ao.RigidityEnabled=true; ao.MaxTorque=1e9; ao.Responsiveness=200
+
+        FR.enabled = true
+        FR.anchor, FR.pad, FR.a0, FR.a1, FR.ap, FR.ao = anchor, pad, a0, a1, ap, ao
+        notify("Freeze ON (lock di atas air)")
+    else
+        if FR.anchor then FR.anchor.CFrame = CFrame.new(posCF.Position) end
+        if FR.pad then
+            local hipH = (hum and hum.HipHeight) or FR.saved.hip or 2
+            FR.pad.CFrame = computePadCF(posCF.Position, hipH, FR.pad.Size.Y)
+        end
+    end
+end
+local function disableFreeze()
+    if not FR.enabled then return end
+    for _,o in ipairs({FR.ap, FR.ao, FR.a0, FR.a1, FR.anchor, FR.pad}) do pcall(function() if o then o:Destroy() end end) end
+    local hrp = getRoot()
+    local hum = hrp.Parent:FindFirstChildOfClass("Humanoid")
+    if hum and FR.saved then
+        hum.AutoRotate = (FR.saved.autoRotate~=nil) and FR.saved.autoRotate or hum.AutoRotate
+        hum.WalkSpeed  = (FR.saved.walk~=nil) and FR.saved.walk or hum.WalkSpeed
+        if FR.saved.useJP then hum.JumpPower = FR.saved.jump or hum.JumpPower else hum.JumpHeight = FR.saved.jump or hum.JumpHeight end
+        if FR.saved.platform~=nil then hum.PlatformStand = FR.saved.platform end
+    end
+    if FR.saved and FR.saved.anchored~=nil then hrp.Anchored = FR.saved.anchored end
+    FR.enabled=false; FR.saved=nil; FR.anchor=nil; FR.pad=nil; FR.a0=nil; FR.a1=nil; FR.ap=nil; FR.ao=nil
+    notify("Freeze OFF")
+end
+Players.LocalPlayer.CharacterAdded:Connect(function() if FR.enabled then disableFreeze() end end)
+
+local function buildStandCFFromWater(cfPivot, waterPos)
+    local up = cfPivot.UpVector
+    local look = cfPivot.LookVector
+    look = Vector3.new(look.X,0,look.Z); if look.Magnitude<1e-3 then look=Vector3.new(0,0,-1) end
+    local standPos = waterPos + up * UP_OFFSET
+    return CFrame.lookAt(standPos, standPos + look.Unit, up)
+end
+
+-- Lock mode
+local lockRunning, scanThread = false, nil
+local lockedStandCF, lastPivotPos, lastEventPivotCF = nil, nil, nil
+local lastRecenterAt, lastRelockAt = 0, 0
+
+local function doRelock()
+    local now = os.clock()
+    if (now - lastRelockAt) < RELOCK_MIN_GAP then return false end
+    __waterPartsCache = nil
+    local cf = getEventPivotCF(EVENT_NAME); if not cf then return false end
+    local ok, wpos, tag = findWaterRobust(cf); if not ok then return false end
+
+    lockedStandCF   = buildStandCFFromWater(cf, wpos)
+    lastPivotPos    = cf.Position
+    lastEventPivotCF= cf
+    lastRelockAt    = now
+
+    local hrp = getRoot()
+    hrp.CFrame = lockedStandCF
+    enableFreezeAt(lockedStandCF)
+    notify(("Lock @ +3.5 above water [%s]"):format(tag))
+    return true
+end
+
+local function startLockMode(eventNameOpt)
+    if eventNameOpt and typeof(eventNameOpt)=="string" then EVENT_NAME = eventNameOpt end
+    if lockRunning then return end
+    lockRunning = true
+
+    scanThread = task.spawn(function()
+        local lastPropsExists = nil
+        while lockRunning do
+            local props = workspace:FindFirstChild("Props")
+            local propsExists = (props ~= nil)
+
+            if propsExists then
+                local cf = getEventPivotCF(EVENT_NAME)
+                if cf then
+                    lastEventPivotCF = cf
+                    if (not lockedStandCF) then
+                        doRelock()
+                    else
+                        local hrp = getRoot()
+                        local now = os.clock()
+                        local dist = (hrp.Position - lockedStandCF.Position).Magnitude
+                        if dist > DRIFT_THRESHOLD and (now - lastRecenterAt) >= RECENTER_MIN_GAP then
+                            hrp.CFrame = lockedStandCF
+                            enableFreezeAt(lockedStandCF)
+                            lastRecenterAt = now
+                        end
+                        if lastPivotPos then
+                            local dH = (Vector3.new(cf.Position.X,0,cf.Position.Z) - Vector3.new(lastPivotPos.X,0,lastPivotPos.Z)).Magnitude
+                            if dH > RELOCK_THRESHOLD_H then doRelock() end
+                        else
+                            doRelock()
+                        end
+                    end
+                else
+                    doRelock()
+                end
+            else
+                -- Event berakhir: TP ke posisi event terakhir (free fish)
+                if lastPropsExists == true then
+                    if lastEventPivotCF then
+                        local hrp = getRoot()
+                        hrp.CFrame = lastEventPivotCF + Vector3.new(0, 4, 0)
+                        disableFreeze()
+                        lockedStandCF = nil
+                        notify("Event selesai → TP ke posisi event terakhir.")
+                    end
+                end
+            end
+
+            lastPropsExists = propsExists
+            task.wait(SCAN_INTERVAL)
+        end
+    end)
+    notify(("Lock Mode: ON (%s) — scan Props aktif"):format(EVENT_NAME))
+end
+local function stopLockMode()
+    lockRunning = false
+    if scanThread then pcall(function() task.cancel(scanThread) end) end
+    scanThread = nil
+    disableFreeze()
+    lockedStandCF = nil
+    notify("Lock Mode: OFF")
+end
+
+--========================================================
+--= DeepSea Route (TreasureRoom → Sisyphus) + progress UI
+--========================================================
+local function safePivotCharacter(char, cf)
+    if not char then return end
+    pcall(function()
+        if char.PrimaryPart and char.PrimaryPart:IsA("BasePart") then
+            char:PivotTo(cf + Vector3.new(0,4,0)); return
+        end
+        local hrp = char:FindFirstChild("HumanoidRootPart"); if hrp then hrp.CFrame = cf + Vector3.new(0,4,0) end
+    end)
+end
+
+local function _deepSeaSnapshot()
+    local res = { q1 = {cur = 0, target = 300}, q2 = {cur = 0, target = 3}, q3 = {cur = 0, target = 1} }
+    if not dataReplion then return res end
+    local ds = dataReplion:Get("DeepSea")
+    local list = ds and ds.Available and ds.Available.Forever and ds.Available.Forever.Quests
+    if type(list) ~= "table" then return res end
+
+    for _, q in ipairs(list) do
+        local def
+        if q.QuestId ~= nil then
+            local okd, dd = pcall(QuestUtility.GetQuestData, QuestUtility, "DeepSea", "Forever", q.QuestId)
+            if okd then def = dd end
+        end
+        if def and def.Arguments then
+            local ok, target = pcall(QuestUtility.GetQuestValue, QuestUtility, dataReplion, def)
+            target = ok and tonumber(target) or nil
+            local cur = tonumber(q.Progress) or 0
+
+            if def.Arguments.key == "CatchRareTreasureRoom" then
+                res.q1.cur = math.min(cur, target or res.q1.target)
+                res.q1.target = target or res.q1.target
+            end
+            if def.Arguments.key == "CatchFish" and def.Arguments.conditions and def.Arguments.conditions.Tier == 6 then
+                res.q2.cur = math.min(cur, target or res.q2.target)
+                res.q2.target = target or res.q2.target
+            end
+            if def.Arguments.key == "CatchFish" and def.Arguments.conditions and def.Arguments.conditions.Tier == 7 then
+                res.q3.cur = math.min(cur, target or res.q3.target)
+                res.q3.target = target or res.q3.target
+            end
+        end
+    end
+    return res
+end
+
+local CF_TREASURE = CFrame.new(
+  -3598.899658203125,-275.8966064453125,-1641.55126953125,
+  0.931654155254364,-3.726474773202426e-8,-0.3633463382720947,
+  1.3687012412333388e-8,1,-6.746506642230088e-8,
+  0.3633463382720947,5.7880981785274346e-8,0.931654155254364
+)
+local CF_SISY = CFrame.new(
+  -3708.547607421875,-135.07391357421876,-1011.6010131835938,
+  -0.9994406700134277,-1.0463620014888875e-7,0.03344225883483887,
+  -1.0513283399404827e-7,1,-1.3092193995589696e-8,
+  -0.03344225883483887,-1.6600750996076387e-8,-0.9994406700134277
+)
+
+local routeRunning, routeToken = false, 0
+local q1Label, q2Label, q3Label, routeLabel
+
+local function breakableWait(sec, myToken)
+    local t0 = os.clock()
+    while os.clock() - t0 < sec do
+        if (not routeRunning) or (myToken ~= routeToken) then return false end
+        task.wait(0.05)
+    end
+    return routeRunning and (myToken == routeToken)
+end
+
+local function _stopRoute()
+    routeRunning = false
+    routeToken += 1
+    stopAllFishingLoops()
+    questPreset_onStop()
+    if routeLabel and routeLabel.Set then routeLabel:Set("Route: idle") end
+    notify("DeepSea Route: STOP")
+end
+
+local function _startRoute()
+    _stopRoute()
+    routeToken += 1
+    local myToken = routeToken
+    routeRunning = true
+    if routeLabel and routeLabel.Set then routeLabel:Set("Route: running") end
+
+    questPreset_onStart()
+
+    task.spawn(function()
+        -- STEP 1 — Treasure Room
+        local char = Players.LocalPlayer.Character or Players.LocalPlayer.CharacterAdded:Wait()
+        safePivotCharacter(char, CF_TREASURE)
+        if not breakableWait(0.40, myToken) then return end
+        start_Anim()
+
+        local lastQ1, stagnate = -1, 0
+        while routeRunning and myToken == routeToken do
+            local snap = _deepSeaSnapshot()
+            if q1Label then q1Label:Set(("Treasure Room Rare/Epic: %d/%d"):format(snap.q1.cur, snap.q1.target)) end
+            if q2Label then q2Label:Set(("Sisyphus Mythic: %d/%d"):format(snap.q2.cur, snap.q2.target)) end
+            if q3Label then q3Label:Set(("Sisyphus SECRET: %d/%d"):format(snap.q3.cur, snap.q3.target)) end
+
+            if snap.q1.cur == lastQ1 then stagnate += 0.8 else lastQ1, stagnate = snap.q1.cur, 0 end
+            if __currentPreset:find("Fast") and stagnate >= 8.0 then
+                notify("Treasure Room macet → fallback Balanced(Quest)")
+                questPreset_fallbackBalanced()
+            end
+            if snap.q1.cur >= snap.q1.target then break end
+            if not breakableWait(0.80, myToken) then return end
+        end
+        if (not routeRunning) or (myToken ~= routeToken) then return end
+        notify("Quest 1 selesai: 300 Rare/Epic @ Treasure Room")
+
+        -- STEP 2 — Sisyphus
+        local char2 = Players.LocalPlayer.Character or Players.LocalPlayer.CharacterAdded:Wait()
+        safePivotCharacter(char2, CF_SISY)
+        if not breakableWait(0.40, myToken) then return end
+        start_Anim()
+
+        local lastSum, stagnate2 = -1, 0
+        while routeRunning and myToken == routeToken do
+            local snap = _deepSeaSnapshot()
+            if q1Label then q1Label:Set(("Treasure Room Rare/Epic: %d/%d"):format(snap.q1.cur, snap.q1.target)) end
+            if q2Label then q2Label:Set(("Sisyphus Mythic: %d/%d"):format(snap.q2.cur, snap.q2.target)) end
+            if q3Label then q3Label:Set(("Sisyphus SECRET: %d/%d"):format(snap.q3.cur, snap.q3.target)) end
+
+            local sumNow = (snap.q2.cur or 0) * 10 + (snap.q3.cur or 0)
+            if sumNow == lastSum then stagnate2 += 1.0 else lastSum, stagnate2 = sumNow, 0 end
+            if __currentPreset:find("Fast") and stagnate2 >= 10.0 then
+                notify("Sisyphus macet → fallback Balanced(Quest)")
+                questPreset_fallbackBalanced()
+            end
+            if snap.q2.cur >= snap.q2.target and snap.q3.cur >= snap.q3.target then break end
+            if not breakableWait(1.00, myToken) then return end
+        end
+        if (not routeRunning) or (myToken ~= routeToken) then return end
+
+        notify("DeepSea: selesai (3 Mythic + 1 SECRET @ Sisyphus) 🎉")
+        if routeLabel and routeLabel.Set then routeLabel:Set("Route: done") end
+        _stopRoute()
+    end)
+end
+
+--========================================================
+--= Auto Favorite (Replion) + helpers
+--========================================================
+local __ItemIdMapCache
+local function buildItemIdMap()
+    if __ItemIdMapCache then return __ItemIdMapCache end
+    local map = {}
+    local ok, ItemsMod = pcall(function() return require(ReplicatedStorage:WaitForChild("Items")) end)
+    if not ok or type(ItemsMod) ~= "table" then return map end
+    for name, def in pairs(ItemsMod) do
+        local d = def and def.Data
+        if d and d.Id then
+            local tierVal = d.Tier or d.Rarity or d.Rank or d.Level or d.Quality
+            local tierName
+            if (not tierVal) and def.Probability and def.Probability.Chance and TierUtility then
+                pcall(function()
+                    local td = TierUtility:GetTierFromRarity(def.Probability.Chance)
+                    if td then tierVal = td.Tier or tierVal; tierName = td.Name or tierName end
+                end)
+            end
+            map[d.Id] = { Name=name, Type=d.Type, Tier=tierVal, TierName=tierName, Probability=def.Probability }
+        end
+    end
+    __ItemIdMapCache = map
+    return __ItemIdMapCache
+end
+
+local function collectInventoryEntries()
+    if not dataReplion then return {}, "Replion Data tidak tersedia" end
+    local inv
+    local ok, err = pcall(function() inv = dataReplion:Get("Inventory") end)
+    if not ok then return {}, "Gagal Get(Inventory): " .. tostring(err) end
+    if type(inv) ~= "table" then return {}, "Inventory bukan tabel" end
+    local acc, seen = {}, {}
+    local function addItem(t)
+        local uuid = t.UUID or t.Uuid or t.uuid
+        if uuid and t.Id and not seen[uuid] then
+            seen[uuid] = true
+            table.insert(acc, { UUID=uuid, Id=t.Id, Metadata=t.Metadata, Favorited=t.Favorited, Quantity=t.Quantity })
+        end
+    end
+    for _,item in pairs(inv) do if type(item)=="table" and item.Id and (item.UUID or item.Uuid or item.uuid) then addItem(item) end end
+    for _,cat in ipairs({"Fishes","Items","Potions","Baits","Fishing Rods","FishingRods","Rods"}) do
+        local bucket = inv[cat]; if type(bucket)=="table" then for _,entry in pairs(bucket) do if type(entry)=="table" then addItem(entry) end end end
+    end
+    if #acc==0 then
+        local function rec(t, d) if d>5 then return end
+            for _,v in pairs(t) do if type(v)=="table" then if v.Id and (v.UUID or v.Uuid or v.uuid) then addItem(v) end rec(v, d+1) end end
+        end
+        rec(inv, 1)
+    end
+    if #acc==0 then return acc, "Inventory kosong / tidak ada item ber-UUID" end
+    return acc
+end
+
+local autoFavEnabled = false
+local favConnections, favPendingScan, favBusy = {}, false, false
+local selectedFavTierNames, selectedFavTiersSet = {}, {}
+local favTierStatus
+
+local function scanAndFav()
+    if not autoFavEnabled or favBusy then return end
+    favBusy = true
+    local entries, err = collectInventoryEntries()
+    if err then if favTierStatus then favTierStatus:Set("Scan error: "..tostring(err)) end favBusy=false return end
+    local idMap = buildItemIdMap()
+    local added = 0
+    for _,inst in ipairs(entries) do
+        local def = idMap[inst.Id]
+        if def and def.Type == "Fishes" then
+            local tierVal = def.Tier
+            if (not tierVal) then
+                local meta = inst.Metadata or {}
+                if meta and meta.VariantId and ItemUtility then
+                    pcall(function()
+                        local vd = ItemUtility:GetVariantData(meta.VariantId)
+                        if vd and vd.Data then tierVal = vd.Data.Tier end
+                    end)
+                end
+            end
+            local uuid = inst.UUID or inst.Uuid or inst.uuid
+            if uuid and tierVal and selectedFavTiersSet[tierVal] and (not inst.Favorited) then
+                local ok = pcall(function() if RE_FavoriteItem then RE_FavoriteItem:FireServer(uuid) end end)
+                if ok then added = added + 1 task.wait(0.08) end
+            end
+        end
+    end
+    if favTierStatus then
+        local sel = (#selectedFavTierNames>0) and table.concat(selectedFavTierNames,",") or "(none)"
+        favTierStatus:Set(string.format("Auto Fav: +%d (%s)", added, sel))
+    end
+    favBusy = false
+end
+local function scheduleFavScan(delaySec)
+    if not autoFavEnabled or favPendingScan then return end
+    favPendingScan = true
+    task.delay(delaySec or 0.1, function() favPendingScan = false; scanAndFav() end)
+end
+local function clearFavHooks()
+    for _,c in ipairs(favConnections) do pcall(function() c:Disconnect() end) end
+    favConnections = {}
+end
+
+local replionClientOk, ReplionClient2 = pcall(function()
+    return require(ReplicatedStorage:WaitForChild("Packages"):WaitForChild("Replion")).Client
+end)
+local dataReplion2 = nil
+if replionClientOk then pcall(function() dataReplion2 = ReplionClient2:WaitReplion("Data") end) end
+
+local function ensureFavHooks()
+    if not dataReplion2 then return end
+    if favConnections._hooked then return end
+    favConnections._hooked = true
+    pcall(function()
+        if dataReplion2.OnUpdate then
+            table.insert(favConnections, dataReplion2:OnUpdate("Inventory", function() scheduleFavScan(0.05) end))
+        end
+    end)
+    pcall(function()
+        if dataReplion2.OnChanged then
+            table.insert(favConnections, dataReplion2.OnChanged:Connect(function(key) if key=="Inventory" then scheduleFavScan(0.05) end end))
+        end
+    end)
+    pcall(function()
+        if dataReplion2.Changed then
+            table.insert(favConnections, dataReplion2.Changed:Connect(function(key) if key=="Inventory" then scheduleFavScan(0.05) end end))
+        end
+    end)
+end
+
+local favFallbackThread
+local function startFavFallback()
+    if favFallbackThread then return end
+    favFallbackThread = task.spawn(function()
+        while autoFavEnabled do
+            scanAndFav()
+            for i=1,10 do if not autoFavEnabled then break end task.wait(0.3) end
+        end
+    end)
+end
+local function stopFavFallback()
+    if favFallbackThread then task.cancel(favFallbackThread) favFallbackThread=nil end
+end
+
+--========================================================
+--= Teleport Island data
+--========================================================
+local _ISLAND_JSON = [[
+[{"name":"Fisherman Island","cf":[66.17740631103516,9.531570434570313,2706.919677734375,0.03526937589049339,0,0.9993778467178345,0,1,0,-0.9993778467178345,0,0.03526937589049339]},
+{"name":"Coral Reefs","cf":[-3103.641357421875,2.304328203201294,2162.08349609375,-0.06437648087739945,-9.210159390704576e-8,-0.9979256987571716,-1.2899413093236945e-8,1,-9.146089041678352e-8,0.9979256987571716,6.984725242631384e-9,-0.06437648087739945]},
+{"name":"Crater Island","cf":[1006.9865112304688,18.160310745239259,5090.7197265625,-0.9712307453155518,1.575498487227378e-8,-0.2381403148174286,3.4911298740780697e-8,1,-7.622372066862227e-8,0.2381403148174286,-8.234460580069936e-8,-0.9712307453155518]},
+{"name":"Altar Enchant","cf":[3232.67724609375,-1302.8548583984376,1402.749267578125,0.3534402549266815,4.8095238014411737e-8,-0.9354571104049683,4.1586602606003e-8,1,6.712613043191596e-8,0.9354571104049683,-6.262755647412632e-8,0.3534402549266815]},
+{"name":"Esoteric Depths","cf":[2038.846923828125,27.39720344543457,1386.0931396484376,0.4719811975955963,6.4564202872929858e-9,-0.8816086053848267,-3.183613150881115e-9,1,5.619063880857311e-9,0.8816086053848267,1.5460827063051853e-10,0.4719811975955963]},
+{"name":"Kohana","cf":[-651.228271484375,16.03544807434082,596.7901000976563,0.8598372340202332,-8.096790082845473e-8,-0.5105682611465454,8.03526845061242e-8,1,-2.3263620363422889e-8,0.5105682611465454,-2.102260410197232e-8,0.8598372340202332]},
+{"name":"Kohana Volcano","cf":[-562.6546630859375,21.28886604309082,156.9301300048828,-0.8166853189468384,-1.1258064702701632e-8,0.5770832300186157,-6.330147961364219e-9,1,1.0550169626810657e-8,-0.5770832300186157,4.963146338354818e-9,-0.8166853189468384]},
+{"name":"Weather Machine","cf":[-1480.64892578125,3.499999761581421,1923.352783203125,-0.9692139625549316,-3.9521559358490779e-8,-0.24622000753879548,-4.052093061091e-8,1,-1.0076699474836915e-9,0.24622000753879548,9.000415523985339e-9,-0.9692139625549316]},
+{"name":"Tropical Grove","cf":[-2149.467041015625,2.608316421508789,3669.84423828125,0.8882874250411987,-2.449999669806857e-8,0.45928794145584109,1.6550767423240132e-9,1,5.014242887568798e-8,-0.45928794145584109,-4.3780733705034439e-8,0.8882874250411987]},
+{"name":"Sisyphus Status","cf":[-3708.547607421875,-135.07391357421876,-1011.6010131835938,-0.9994406700134277,-1.0463620014888875e-7,0.03344225883483887,-1.0513283399404827e-7,1,-1.3092193995589696e-8,-0.03344225883483887,-1.6600750996076387e-8,-0.9994406700134277]},
+{"name":"Treesure Room","cf":[-3598.899658203125,-275.8966064453125,-1641.55126953125,0.931654155254364,-3.726474773202426e-8,-0.3633463382720947,1.3687012412333388e-8,1,-6.746506642230088e-8,0.3633463382720947,5.7880981785274346e-8,0.931654155254364]}]
+]]
+local islandData = (function() local ok, decoded = pcall(HttpService.JSONDecode, HttpService, _ISLAND_JSON); return ok and decoded or {} end)()
+local IslandByName, IslandNames = {}, {}
+for _, item in ipairs(islandData) do
+    if item and item.name and item.cf and #item.cf == 12 then
+        IslandByName[item.name] = CFrame.new(table.unpack(item.cf))
+        table.insert(IslandNames, item.name)
+    end
+end
+table.sort(IslandNames)
+
+--========================================================
+--= GUI (IkanTongkol)
+--========================================================
+local Window = IKUI:CreateWindow({
+    Name  = "Auto Fishing • Quest",
+    Title = "Ikan Tongkol • by king jawa",
+    Size  = UDim2.new(0.62, 0, 0.82, 0),
+})
+__uiWindow = Window
+
+-- Best-effort: coba bikin window draggable (tanpa ubah IKUI internal)
+task.delay(0.6, function()
+    local UIS = game:GetService("UserInputService")
+    local function makeDraggable(frame: Frame)
+        if not frame then return end
+        local dragging, dragStart, startPos
+        frame.InputBegan:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1 then
+                dragging = true; dragStart = input.Position; startPos = frame.Position
+                input.Changed:Connect(function()
+                    if input.UserInputState == Enum.UserInputState.End then dragging = false end
+                end)
+            end
+        end)
+        UIS.InputChanged:Connect(function(input)
+            if dragging and input.UserInputType==Enum.UserInputType.MouseMovement then
+                local delta = input.Position - dragStart
+                frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+            end
+        end)
+    end
+    local pg = LocalPlayer:FindFirstChild("PlayerGui")
+    if pg then
+        -- cari frame besar di ScreenGui yang memuat judul "Ikan"
+        for _,sg in ipairs(pg:GetChildren()) do
+            if sg:IsA("ScreenGui") then
+                local topFrame = sg:FindFirstChildWhichIsA("Frame", true)
+                if topFrame and topFrame.AbsoluteSize.Y > 80 then
+                    makeDraggable(topFrame)
+                    break
+                end
+            end
+        end
+    end
+end)
+
+-- ===== Main Tab =====
+local MainTab = Window:CreateTab({Name="Main"})
+MainTab:CreateSection("Fishing")
+local StatusLabel = MainTab:CreateLabel("Status: idle")
+
+-- Toggle No-Anim (pakai ServerTime)
+local togNoAnimServer = MainTab:CreateToggle({
+    Name = "No-Anim (pakai GetServerTimeNow)",
+    CurrentValue = false,
+    Flag = "noanim_server",
+    Callback = function(v)
+        if v then
+            if animEnabled then stop_Anim() end
+            useServerTime = true
+            start_NoAnim()
+        else
+            stop_NoAnim()
+        end
+    end
+})
+
+-- Toggle No-Anim (tanpa ServerTime)
+local togNoAnimPlain = MainTab:CreateToggle({
+    Name = "No-Anim (tanpa GetServerTimeNow)",
+    CurrentValue = false,
+    Flag = "noanim_plain",
+    Callback = function(v)
+        if v then
+            if animEnabled then stop_Anim() end
+            if togNoAnimServer.Get and togNoAnimServer:Get() then togNoAnimServer:Set(false) end
+            useServerTime = false
+            start_NoAnim()
+        else
+            stop_NoAnim()
+        end
+    end
+})
+
+-- Toggle Animated
+local animToggle = MainTab:CreateToggle({
+    Name = "Auto Fish (Animated)",
+    CurrentValue = false,
+    Flag = "af_anim",
+    Callback = function(v)
+        if v then
+            if running then togNoAnimServer:Set(false); togNoAnimPlain:Set(false); stop_NoAnim() end
+            start_Anim()
+        else
+            stop_Anim()
+        end
+    end
+})
+
+-- Quick Presets
+MainTab:CreateDropdown({
+    Name = "Quick Presets",
+    Options = { "Safe (stabil)", "Balanced • rekomendasi", "Fast (butuh rod kencang)" },
+    CurrentOption = "Balanced • rekomendasi",
+    Flag = "preset_pick",
+    Callback = function(opt)
+        local map = {["safe"]="Safe",["balanced"]="Balanced",["fast"]="Fast"}
+        local s = tostring(opt):lower()
+        local picked = s:find("safe") and "Safe" or s:find("fast") and "Fast" or "Balanced"
+        applyPreset(picked); _clampServerSafe()
+        notify("Preset: "..picked)
+    end
+})
+
+-- ===== Event Lock Tab =====
+local LockTab = Window:CreateTab({Name="Event Lock"})
+LockTab:CreateSection("Scan Props + Auto-TP Last Spot")
+
+local eventDropdown = LockTab:CreateDropdown({
+    Name = "Pilih Event",
+    Options = EVENT_LIST,
+    CurrentOption = EVENT_LIST[1],
+    Flag = "event_name",
+    Callback = function(opt) EVENT_NAME = opt end
+})
+local lockToggle = LockTab:CreateToggle({
+    Name = "Lock Mode",
+    CurrentValue = false,
+    Flag = "lock_mode",
+    Callback = function(v) if v then startLockMode() else stopLockMode() end end
+})
+LockTab:CreateButton({
+    Name="Unfreeze",
+    Callback=function() stopLockMode(); disableFreeze() end
+})
+
+-- ===== Teleport Island Tab =====
+local TeleTab = Window:CreateTab({Name="Teleport"})
+TeleTab:CreateSection("Island")
+local selectedIslandName
+TeleTab:CreateDropdown({
+    Name="Pilih Island",
+    Options=IslandNames,
+    CurrentOption=IslandNames[1] or "",
+    Flag="island_pick",
+    Callback=function(opt) selectedIslandName=opt end
+})
+TeleTab:CreateButton({
+    Name="Teleport",
+    Callback=function()
+        local cf = selectedIslandName and IslandByName[selectedIslandName]
+        if not cf then notify("Pilih island dulu."); return end
+        local hrp = getRoot(); hrp.CFrame = cf + Vector3.new(0,5,0)
+        notify("Teleport ke: "..tostring(selectedIslandName))
+    end
+})
+
+-- ===== helper ringan (tidak bentrok dgn fungsi lain) =====
+local function _notify(msg)
+    pcall(function()
+        game:GetService("StarterGui"):SetCore("SendNotification", {
+            Title = "Info", Text = tostring(msg), Duration = 2
+        })
+    end)
+end
+
+local function _getRoot()
+    local char = Players.LocalPlayer.Character or Players.LocalPlayer.CharacterAdded:Wait()
+    return char and char:FindFirstChild("HumanoidRootPart")
+end
+
+-- ===== AUTO RANDOM TELEPORT (timer via INPUT) =====
+MainTab:CreateSection("Auto Random Teleport")
+
+-- Durasi total (menit) via TextBox
+local durationMin = 10
+MainTab:CreateInput({
+    Name = "Durasi (menit)",
+    DefaultText = tostring(durationMin),
+    PlaceholderText = "contoh: 10",
+    Callback = function(txt)
+        local n = tonumber(txt)
+        if n and n >= 1 and n <= 180 then
+            durationMin = math.floor(n)
+            _notify(("Durasi diset: %d menit"):format(durationMin))
+        else
+            _notify("Isi angka 1–180 menit.")
+        end
+    end
+})
+
+-- Runner state
+-- ===== AUTO RANDOM TELEPORT (toggle ON = jalan terus; interval dlm MENIT) =====
+MainTab:CreateSection("Auto Random Teleport")
+
+-- Ganti map tiap berapa menit
+local tpIntervalMin = 10
+MainTab:CreateInput({
+    Name = "Ganti map tiap (menit)",
+    DefaultText = tostring(tpIntervalMin),
+    PlaceholderText = "mis: 10",
+    Callback = function(txt)
+        local n = tonumber(txt)
+        if n and n >= 1 and n <= 180 then
+            tpIntervalMin = math.floor(n)
+            _notify(("Interval ganti map: %d menit"):format(tpIntervalMin))
+        else
+            _notify("Isi angka 1–180 menit.")
+        end
+    end
+})
+
+-- Helper: tebak island terdekat (biar siklus awal dianggap 'A')
+local function _guessCurrentIsland()
+    local hrp = _getRoot()
+    local pos = hrp and hrp.Position
+    if not pos then return nil end
+    local bestName, bestD = nil, 1/0
+    for name, cf in pairs(IslandByName) do
+        local d = (cf.Position - pos).Magnitude
+        if d < bestD then bestD, bestName = d, name end
+    end
+    return bestName
+end
+
+-- Helper: pilih island baru (beda dari exclude)
+local function _pickNextIsland(exclude)
+    if #IslandNames == 0 then return nil end
+    if #IslandNames == 1 then return IslandNames[1] end
+    local name
+    repeat
+        name = IslandNames[math.random(1, #IslandNames)]
+    until name ~= exclude
+    return name
+end
+
+-- State + token
+local AutoTP = { running = false, token = 0, current = nil }
+local autoTPtoggle
+
+autoTPtoggle = MainTab:CreateToggle({
+    Name = "Auto Teleport Random (tiap X menit)",
+    CurrentValue = false,
+    Flag = "auto_tp_random_toggle",
+    Callback = function(on)
+        if on then
+            if AutoTP.running then return end
+            if #IslandNames == 0 then
+                _notify("Daftar island kosong.")
+                if autoTPtoggle and autoTPtoggle.Set then autoTPtoggle:Set(false) end
+                return
+            end
+
+            AutoTP.running = true
+            AutoTP.token += 1
+            local myToken = AutoTP.token
+            AutoTP.current = _guessCurrentIsland() -- anggap ini 'A'
+            _notify(("Auto TP: ON (ganti tiap %d menit)"):format(tpIntervalMin))
+
+            task.spawn(function()
+                while AutoTP.running and AutoTP.token == myToken do
+                    -- Tunggu X menit dulu (tetap di island sekarang)
+                    local left = tpIntervalMin * 60
+                    while AutoTP.running and AutoTP.token == myToken and left > 0 do
+                        left -= task.wait(math.min(0.5, left))
+                    end
+                    if not (AutoTP.running and AutoTP.token == myToken) then break end
+
+                    -- Pilih island baru ≠ current, lalu teleport
+                    local nextName = _pickNextIsland(AutoTP.current)
+                    local cf = nextName and IslandByName[nextName]
+                    local hrp = _getRoot()
+                    if cf and hrp then
+                        pcall(function() hrp.CFrame = cf + Vector3.new(0, 5, 0) end)
+                        _notify("Teleport → " .. tostring(nextName))
+                        AutoTP.current = nextName
+                    else
+                        _notify("Gagal teleport (cf/hrp nil).")
+                    end
+                    -- loop lanjut; interval bisa kamu ubah kapan saja via input (dibaca per siklus)
+                end
+
+                if AutoTP.token == myToken then
+                    AutoTP.running = false
+                    _notify("Auto TP: OFF (selesai)")
+                    if autoTPtoggle and autoTPtoggle.Set then autoTPtoggle:Set(false) end
+                end
+            end)
+        else
+            if AutoTP.running then
+                AutoTP.running = false
+                AutoTP.token += 1 -- batalkan loop aktif
+                _notify("Auto TP: OFF (dihentikan)")
+            end
+        end
+    end
+})
+
+
+-- ===== Fram/Quest Tab (DeepSea) =====
+local FramTab = Window:CreateTab({Name="DeepSea"})
+FramTab:CreateSection("Progress")
+q1Label = FramTab:CreateLabel("Treasure Room Rare/Epic: 0/300")
+q2Label = FramTab:CreateLabel("Sisyphus Mythic: 0/3")
+q3Label = FramTab:CreateLabel("Sisyphus SECRET: 0/1")
+routeLabel = FramTab:CreateLabel("Route: idle")
+
+FramTab:CreateSection("Route Control")
+FramTab:CreateToggle({
+    Name = "Run DeepSea Route (TP + Monitor)",
+    CurrentValue = false,
+    Flag = "deepsea_route_toggle",
+    Callback = function(on) if on then _startRoute() else _stopRoute() end end
+})
+
+-- refresher label saat route tidak jalan
+task.spawn(function()
+    while true do
+        if not routeRunning then
+            local s = _deepSeaSnapshot()
+            if q1Label then q1Label:Set(("Treasure Room Rare/Epic: %d/%d"):format(s.q1.cur, s.q1.target)) end
+            if q2Label then q2Label:Set(("Sisyphus Mythic: %d/%d"):format(s.q2.cur, s.q2.target)) end
+            if q3Label then q3Label:Set(("Sisyphus SECRET: %d/%d"):format(s.q3.cur, s.q3.target)) end
+        end
+        task.wait(0.8)
+    end
+end)
+
+-- ===== Shop Tab =====
+local ShopTab = Window:CreateTab({Name="Shop"})
+ShopTab:CreateSection("Rods")
+local rodInfoLabel = ShopTab:CreateLabel("Pilih rod.")
+local Rods = {
+    ["Starter Rod"]={Id=1,Price=50},["Luck Rod"]={Id=79,Price=350},["Carbon Rod"]={Id=76,Price=900},
+    ["Grass Rod"]={Id=85,Price=1500},["Demascus Rod"]={Id=77,Price=3000},["Ice Rod"]={Id=78,Price=5000},
+    ["Lucky Rod"]={Id=4,Price=15000},["Midnight Rod"]={Id=80,Price=50000},["Steampunk Rod"]={Id=6,Price=215000},
+    ["Chrome Rod"]={Id=7,Price=437000},["Astral Rod"]={Id=5,Price=1000000},["Ares Rod"]={Id=126,Price=3000000}
+}
+local RF_PurchaseRod  = netRoot:WaitForChild("RF/PurchaseFishingRod")
+
+local selectedRodName
+ShopTab:CreateDropdown({
+    Name="Pilih Rod",
+    Options=(function() local t={} for n,_ in pairs(Rods) do table.insert(t,n) end table.sort(t) return t end)(),
+    CurrentOption="",
+    Flag="rod_pick",
+    Callback=function(opt)
+        selectedRodName=opt
+        local d=Rods[selectedRodName]
+        if type(d)=="table" then rodInfoLabel:Set(("Dipilih: %s | ID=%s | Harga=%s"):format(selectedRodName, d.Id, tostring(d.Price)))
+        else rodInfoLabel:Set("Pilih rod.") end
+    end
+})
+ShopTab:CreateButton({
+    Name="Beli Rod Terpilih",
+    Callback=function()
+        if not selectedRodName or not Rods[selectedRodName] then notify("Pilih rod dulu."); return end
+        local d=Rods[selectedRodName]; local id=d.Id
+        local ok,err = pcall(function() RF_PurchaseRod:InvokeServer(id) end)
+        if ok then notify(("Beli rod: %s (%s)"):format(selectedRodName, id)) else notify("Gagal beli rod: "..tostring(err)) end
+    end
+})
+
+ShopTab:CreateSection("Baits")
+local baitInfoLabel = ShopTab:CreateLabel("Pilih bait.")
+local Baits = {
+    {Id=10,Name="Topwater Bait",Price=100},{Id=2,Name="Luck Bait",Price=1000},{Id=3,Name="Midnight Bait",Price=3000},
+    {Id=17,Name="Nature Bait",Price=83500},{Id=6,Name="Chroma Bait",Price=290000},{Id=8,Name="Dark Matter Bait",Price=630000},
+    {Id=15,Name="Corrupt Bait",Price=1148484},{Id=16,Name="Aether Bait",Price=3700000},
+}
+local baitByName, baitNames = {}, {}
+for _,b in ipairs(Baits) do baitByName[b.Name]=b table.insert(baitNames,b.Name) end table.sort(baitNames)
+local RF_PurchaseBait = netRoot:FindFirstChild("RF/PurchaseBait") or netRoot:WaitForChild("RF/PurchaseBait",5)
+
+local selectedBaitName
+ShopTab:CreateDropdown({
+    Name="Pilih Bait", Options=baitNames, CurrentOption="", Flag="bait_pick",
+    Callback=function(opt)
+        selectedBaitName=opt
+        local b=baitByName[selectedBaitName]
+        if b then baitInfoLabel:Set(("Dipilih: %s | ID=%s | Harga=%s"):format(b.Name,b.Id,tostring(b.Price))) else baitInfoLabel:Set("Pilih bait.") end
+    end
+})
+ShopTab:CreateButton({
+    Name="Beli Bait Terpilih",
+    Callback=function()
+        if not RF_PurchaseBait then notify("Remote PurchaseBait tidak ditemukan."); return end
+        if not selectedBaitName or not baitByName[selectedBaitName] then notify("Pilih bait dulu."); return end
+        local id = baitByName[selectedBaitName].Id
+        local ok,err=pcall(function() RF_PurchaseBait:InvokeServer(id) end)
+        if ok then notify(("Beli bait: %s (%s)"):format(selectedBaitName,id)) else notify("Gagal beli bait: "..tostring(err)) end
+    end
+})
+
+-- ===== Inventory Tab =====
+local InventoryTab = Window:CreateTab({Name="Inventory"})
+InventoryTab:CreateSection("Auto Sell")
+local SellAllRemote = netRoot:FindFirstChild("RF/SellAllItems") or netRoot:WaitForChild("RF/SellAllItems",5)
+local sellStatusLabel = InventoryTab:CreateLabel("Auto Sell: OFF")
+
+local function startAutoSell()
+    if autoSellThread then task.cancel(autoSellThread) end
+    autoSellThread = task.spawn(function()
+        while autoSellEnabled do
+            local ok, err = pcall(function()
+                if SellAllRemote then SellAllRemote:InvokeServer() else error("SellAllRemote nil") end
+            end)
+            if ok then sellStatusLabel:Set("Auto Sell: Terjual @"..os.date("%H:%M:%S"))
+            else sellStatusLabel:Set("Auto Sell Error: "..tostring(err)) end
+            local t0=os.clock()
+            while autoSellEnabled do
+                local e=os.clock()-t0
+                if e>=sellInterval then break end
+                task.wait(math.min(1, sellInterval-e))
+            end
+        end
+        sellStatusLabel:Set("Auto Sell: OFF")
+    end)
+end
+
+InventoryTab:CreateToggle({
+    Name="Auto Sell All Ikan",
+    CurrentValue=false, Flag="autosell_toggle",
+    Callback=function(v)
+        autoSellEnabled=v
+        if v then sellStatusLabel:Set("Auto Sell: ON (interval="..sellInterval.."s)"); startAutoSell()
+        else if autoSellThread then task.cancel(autoSellThread) autoSellThread=nil end sellStatusLabel:Set("Auto Sell: OFF") end
+    end
+})
+InventoryTab:CreateInput({
+    Name="Interval Detik", PlaceholderText=tostring(sellInterval),
+    Callback=function(txt)
+        local v=tonumber(txt); if not v then notify("Masukkan angka valid."); return end
+        sellInterval = math.clamp(math.floor(v), 5, 3600)
+        if autoSellEnabled then sellStatusLabel:Set("Auto Sell: ON (interval="..sellInterval.."s)")
+        else sellStatusLabel:Set("Auto Sell: OFF (interval siap="..sellInterval.."s)") end
+    end
+})
+
+InventoryTab:CreateSection("Auto Favorite (Live)")
+favTierStatus = InventoryTab:CreateLabel("Auto Fav: OFF")
+local tierNamesArr = {"Common","Uncommon","Rare","Epic","Legendary","Mythic","SECRET"}
+local tierNameToVal2 = {Common=1,Uncommon=2,Rare=3,Epic=4,Legendary=5,Mythic=6,SECRET=7}
+InventoryTab:CreateDropdown({
+    Name = "Pilih Tier (Fav)",
+    Options = tierNamesArr,
+    CurrentOption = {},
+    MultiSelection = true,
+    Flag = "fav_tiers",
+    Callback = function(opt)
+        local list, set = {}, {}
+        if type(opt)=="table" then
+            for _,nm in ipairs(opt) do local t=tierNameToVal2[nm]; if t then set[t]=true table.insert(list,nm) end end
+        elseif type(opt)=="string" then local t=tierNameToVal2[opt]; if t then set[t]=true list={opt} end end
+        table.sort(list, function(a,b) return (tierNameToVal2[a] or 0) < (tierNameToVal2[b] or 0) end)
+        selectedFavTierNames, selectedFavTiersSet = list, set
+        if favTierStatus then
+            if #list==0 then favTierStatus:Set("Tier dipilih: (none)") else favTierStatus:Set("Tier dipilih: "..table.concat(list,",")) end
+        end
+    end
+})
+InventoryTab:CreateToggle({
+    Name = "Auto Fav (Live)",
+    CurrentValue = false,
+    Flag = "autofav_toggle",
+    Callback = function(v)
+        autoFavEnabled = v
+        if v then
+            favTierStatus:Set("Auto Fav: ON (listen + fallback)")
+            ensureFavHooks()
+            scheduleFavScan(0)
+            startFavFallback()
+        else
+            favTierStatus:Set("Auto Fav: OFF")
+            clearFavHooks()
+            stopFavFallback()
+        end
+    end
+})
+
+-- ===== Status updater =====
+task.spawn(function()
+    while true do
+        if StatusLabel and StatusLabel.Set then
+            if running or animEnabled then
+                StatusLabel:Set("Status: "..tostring(currentStage))
+            else
+                StatusLabel:Set("Status: idle")
+            end
+        end
+        task.wait(0.25)
+    end
+end)
+
+notify("IkanTongkol GUI siap. Selamat mancing! 🎣")
